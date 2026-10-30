@@ -1,0 +1,226 @@
+name: Windows build
+
+on:
+  push:
+    paths:
+      - "game/**"
+      - ".github/workflows/windows-build.yml"
+  pull_request:
+    paths:
+      - "game/**"
+      - ".github/workflows/windows-build.yml"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and package Windows Release
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure with Visual Studio 2022
+        shell: pwsh
+        run: |
+          cmake -S game -B game/build-windows -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build game/build-windows --config Release --parallel
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake Release build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Verify packaged Windows runtime
+        shell: pwsh
+        run: |
+          $outputDirectory = Join-Path $env:GITHUB_WORKSPACE "game/build-windows/Release"
+          $requiredFiles = @("project-dino.exe", "SDL2.dll")
+
+          foreach ($file in $requiredFiles) {
+            $path = Join-Path $outputDirectory $file
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Windows runtime packaging failed: expected '$file' in '$outputDirectory'."
+            }
+          }
+
+          Write-Host "Verified project-dino.exe and SDL2.dll are together in $outputDirectory."
+
+      - name: Build and verify Windows ZIP
+        shell: pwsh
+        run: |
+          cmake --build game/build-windows --config Release --target package-windows --parallel
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows package failed with exit code $LASTEXITCODE."
+          }
+
+          $archive = Join-Path $env:GITHUB_WORKSPACE "game/build-windows/project-dino-windows-x64.zip"
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "Windows package failed: expected '$archive'."
+          }
+
+          $extractionDirectory = Join-Path $env:RUNNER_TEMP ("project-dino-windows-smoke-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $extractionDirectory | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractionDirectory
+
+          $requiredFiles = @("project-dino.exe", "SDL2.dll", "SDL2-LICENSE.txt")
+          foreach ($file in $requiredFiles) {
+            $path = Join-Path $extractionDirectory $file
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Windows ZIP verification failed: expected '$file' after extracting '$archive'."
+            }
+          }
+
+          Write-Host "Verified all required files extracted to $extractionDirectory."
+
+          $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+          $startInfo.FileName = Join-Path $extractionDirectory "project-dino.exe"
+          $startInfo.WorkingDirectory = $extractionDirectory
+          $startInfo.UseShellExecute = $false
+          $startInfo.Environment["PATH"] = "$env:SystemRoot\System32;$env:SystemRoot"
+          $startInfo.Environment["PROJECT_DINO_SMOKE_TEST"] = "1"
+
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class WindowsSmokeTestInput {
+            [DllImport("user32.dll")]
+            public static extern bool SetForegroundWindow(IntPtr window);
+
+            [DllImport("user32.dll")]
+            public static extern bool ShowWindow(IntPtr window, int command);
+
+            [DllImport("user32.dll")]
+            public static extern IntPtr GetForegroundWindow();
+
+            [DllImport("user32.dll")]
+            public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
+          }
+          '@
+
+          $process = [System.Diagnostics.Process]::new()
+          $process.StartInfo = $startInfo
+          $started = $false
+          try {
+            if (-not $process.Start()) {
+              throw "Windows ZIP smoke check failed: the packaged game did not start."
+            }
+            $started = $true
+
+            $titleDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              $process.Refresh()
+              if ($process.HasExited) {
+                throw "Windows ZIP smoke check failed: the game exited before rendering its title screen with code $($process.ExitCode)."
+              }
+              if ($process.MainWindowTitle -eq "PROJECT_DINO_SMOKE_TITLE") {
+                break
+              }
+              Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $titleDeadline)
+
+            if ($process.MainWindowTitle -ne "PROJECT_DINO_SMOKE_TITLE") {
+              throw "Windows ZIP smoke check failed: the rendered title screen was not observed (window title: '$($process.MainWindowTitle)')."
+            }
+            Write-Host "Verified the extracted game rendered its title screen."
+
+            $window = $process.MainWindowHandle
+            if ($window -eq [IntPtr]::Zero) {
+              throw "Windows ZIP smoke check failed: the title screen has no accessible game window."
+            }
+            [void][WindowsSmokeTestInput]::ShowWindow($window, 9)
+            [void][WindowsSmokeTestInput]::SetForegroundWindow($window)
+
+            $focusDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            while ([WindowsSmokeTestInput]::GetForegroundWindow() -ne $window -and
+                   [DateTime]::UtcNow -lt $focusDeadline) {
+              Start-Sleep -Milliseconds 100
+            }
+            if ([WindowsSmokeTestInput]::GetForegroundWindow() -ne $window) {
+              throw "Windows ZIP smoke check failed: the game window could not receive keyboard input."
+            }
+
+            [WindowsSmokeTestInput]::keybd_event([byte]0x0D, [byte]0, [uint32]0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 100
+            [WindowsSmokeTestInput]::keybd_event([byte]0x0D, [byte]0, [uint32]2, [UIntPtr]::Zero)
+
+            $runDeadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+              $process.Refresh()
+              if ($process.HasExited) {
+                throw "Windows ZIP smoke check failed: the game exited after Enter with code $($process.ExitCode)."
+              }
+              if ($process.MainWindowTitle -eq "PROJECT_DINO_SMOKE_RUNNING") {
+                break
+              }
+              Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $runDeadline)
+
+            if ($process.MainWindowTitle -ne "PROJECT_DINO_SMOKE_RUNNING") {
+              throw "Windows ZIP smoke check failed: Enter did not start a run (window title: '$($process.MainWindowTitle)')."
+            }
+            Write-Host "Verified Enter starts a run from the extracted Windows ZIP."
+          }
+          finally {
+            if ($started) {
+              try {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                  [void]$process.CloseMainWindow()
+                  if (-not $process.WaitForExit(5000)) {
+                    $process.Kill($true)
+                    $process.WaitForExit()
+                  }
+                }
+              }
+              finally {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                  $process.Kill($true)
+                  $process.WaitForExit()
+                }
+                $process.Dispose()
+              }
+            } else {
+              $process.Dispose()
+            }
+          }
+
+      - name: Save Windows ZIP for release upload
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-dino-windows-x64
+          path: game/build-windows/project-dino-windows-x64.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Attach Windows ZIP to release
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: project-dino-windows-x64
+          path: release-assets
+
+      - name: Upload ZIP to the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" release-assets/project-dino-windows-x64.zip --repo "$GITHUB_REPOSITORY" --clobber
