@@ -941,7 +941,7 @@ void drawWorld(const Camera3D& camera, Player& player,
 
 }  // namespace
 
-int main() {
+int main(int, char*[]) {
   const bool smokeTest = std::getenv("PROJECT_DINO_SMOKE_TEST") != nullptr;
   SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
   InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Project Dino — Bramblewake");
