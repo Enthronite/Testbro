@@ -105,6 +105,9 @@ jobs:
             public static extern IntPtr GetForegroundWindow();
 
             [DllImport("user32.dll")]
+            public static extern uint MapVirtualKey(uint code, uint mapType);
+
+            [DllImport("user32.dll")]
             public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
           }
           '@
@@ -151,9 +154,14 @@ jobs:
               throw "Windows ZIP smoke check failed: the game window could not receive keyboard input."
             }
 
-            [WindowsSmokeTestInput]::keybd_event([byte]0x0D, [byte]0, [uint32]0, [UIntPtr]::Zero)
+            # SDL identifies Windows key events by their hardware scan code.
+            $enterScanCode = [byte][WindowsSmokeTestInput]::MapVirtualKey(0x0D, 0)
+            if ($enterScanCode -eq 0) {
+              throw "Windows ZIP smoke check failed: Enter has no keyboard scan code."
+            }
+            [WindowsSmokeTestInput]::keybd_event([byte]0x0D, $enterScanCode, [uint32]0, [UIntPtr]::Zero)
             Start-Sleep -Milliseconds 100
-            [WindowsSmokeTestInput]::keybd_event([byte]0x0D, [byte]0, [uint32]2, [UIntPtr]::Zero)
+            [WindowsSmokeTestInput]::keybd_event([byte]0x0D, $enterScanCode, [uint32]2, [UIntPtr]::Zero)
 
             $runDeadline = [DateTime]::UtcNow.AddSeconds(15)
             do {
@@ -198,7 +206,6 @@ jobs:
           }
 
       - name: Save Windows ZIP for release upload
-        if: github.event_name == 'release'
         uses: actions/upload-artifact@v4
         with:
           name: project-dino-windows-x64
